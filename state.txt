@@ -1,5 +1,5 @@
 TURN 1 | menu: -
 MY ACTIVE: Pikachu 85 (Electric)
 THEIR ACTIVE: Manaphy 85 (Water)
-MY BENCH: Gastrodon 82
+MY BENCH: Gastrodon 82 | Zapdos 82
 ADVICE: no battle on screen - open game + Battle Log panel, queue up

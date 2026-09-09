@@ -37,6 +37,17 @@ def acquire_single_instance():
         except (ValueError, OSError):
             pass
     LOCK_FILE.write_text(str(os.getpid()))
+
+    import atexit
+
+    def _cleanup_lock():
+        try:
+            if LOCK_FILE.exists() and LOCK_FILE.read_text().strip() == str(os.getpid()):
+                LOCK_FILE.unlink()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_lock)
     return True
 
 LABEL_OCR_MIN_INTERVAL = 2.5   # seconds between nameplate OCRs per side
@@ -107,9 +118,10 @@ class Coach:
         menu_img = regions.get("menu")
 
         # ---- fast, advice-critical reads first ----
-        menu_changed = menu_img is not None and img_sig(menu_img) != self._last_ocr_img.get("menu")
+        menu_sig = img_sig(menu_img) if menu_img is not None else None
+        menu_changed = menu_sig is not None and menu_sig != self._last_ocr_img.get("menu")
         if menu_changed:
-            self._last_ocr_img["menu"] = img_sig(menu_img)
+            self._last_ocr_img["menu"] = menu_sig
             text = ocr.read_image(menu_img, scale=2)
             if self.debug and text:
                 print("MENU OCR >>>")
@@ -159,13 +171,16 @@ class Coach:
                     self.state.register_party(text or "")
 
         # ---- slow log OCR last (history/scout), capped ----
-        # incremental: newest slice every 2s, full panel resync every 12s
-        log_changed = log_img is not None and img_sig(log_img) != self._last_ocr_img.get("log")
+        # incremental: newest slice every 2s, full panel resync every 12s.
+        # PAUSED while a choice menu is open - those ticks belong to fresh advice.
+        log_sig = img_sig(log_img) if log_img is not None else None
+        log_changed = log_sig is not None and log_sig != self._last_ocr_img.get("log")
+        menu_open = self.state.menu_mode is not None
         if log_changed:
             now = time.time()
             full_resync = now - self._last_full_log > 12.0
-            if now - self._last_log_ocr > 2.0 or full_resync:
-                self._last_ocr_img["log"] = img_sig(log_img)
+            if (now - self._last_log_ocr > 2.0 or full_resync) and (not menu_open or full_resync):
+                self._last_ocr_img["log"] = log_sig
                 self._last_log_ocr = now
                 if full_resync:
                     self._last_full_log = now
@@ -189,7 +204,9 @@ class Coach:
 
         try:
             results = advise(self.state)
-        except Exception:
+        except Exception as e:
+            from procoach import log_error
+            log_error(f"advise failed: {type(e).__name__}: {e}")
             if self.debug:
                 import traceback
                 traceback.print_exc()

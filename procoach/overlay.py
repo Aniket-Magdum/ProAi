@@ -1,4 +1,5 @@
-"""Always-on-top advice overlay: borderless, draggable, resizable, closable."""
+"""Always-on-top advice overlay: borderless, draggable, resizable, closable.
+Per-line colors via a tk.Text widget (category -> color)."""
 import tkinter as tk
 
 COLORS = {
@@ -40,25 +41,24 @@ class Overlay:
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: self.root.destroy())
 
-        self.body = tk.Label(
-            self.root, text="starting...", fg="#CCCCCC", bg="#0d1117",
-            font=("Consolas", 10), anchor="nw", justify="left",
-            wraplength=self._w - 16,
+        self.body = tk.Text(
+            self.root, bg="#0d1117", fg="#CCCCCC", bd=0,
+            highlightthickness=0, font=("Consolas", 10),
+            state="disabled", wrap="word",
         )
         self.body.pack(fill="both", expand=True, padx=8, pady=(4, 18))
+        for cat, col in COLORS.items():
+            self.body.tag_configure(cat, foreground=col)
 
         # resize grip (bottom-right corner)
         grip = tk.Label(self.root, text=" ⛶ ", fg="#8B949E", bg="#0d1117",
                         font=("Consolas", 10), cursor="sizing")
         grip.place(relx=1.0, rely=1.0, anchor="se", x=-2, y=-2)
 
-        # drag bindings
         self.header.bind("<Button-1>", self._drag_start)
         self.header.bind("<B1-Motion>", self._drag_move)
-        # resize bindings
-        for wdg in (grip,):
-            wdg.bind("<Button-1>", self._resize_start)
-            wdg.bind("<B1-Motion>", self._resize_move)
+        grip.bind("<Button-1>", self._resize_start)
+        grip.bind("<B1-Motion>", self._resize_move)
 
         self._on_tick = on_tick
         self.root.after(600, self._tick)
@@ -82,13 +82,12 @@ class Overlay:
         nh = max(MIN_H, self._rh + e.y_root - self._ry)
         self._w = nw
         self.root.geometry(f"{nw}x{nh}")
-        self.body.config(wraplength=nw - 16)
 
     def _tick(self):
         try:
             lines = self._on_tick()
             if lines is None:
-                self.body.config(text="PROClient not found - open the game", fg="#FF6B6B")
+                text, tags = [("PROClient not found - open the game", "beware")]
             else:
                 def rank(pair):
                     t = pair[1].upper()
@@ -98,10 +97,12 @@ class Overlay:
                         return 1
                     return 2
                 lines = sorted(lines, key=rank)[:8]
-                self.body.config(
-                    text="\n".join(t for _, t in lines) or "waiting for battle...",
-                    fg="#7CFC00" if lines and rank(lines[0]) == 0 else "#CCCCCC",
-                )
+                text = [(t, cat) for cat, t in lines] or [("waiting for battle...", "info")]
+            self.body.config(state="normal")
+            self.body.delete("1.0", "end")
+            for t, cat in text:
+                self.body.insert("end", t + "\n", cat)
+            self.body.config(state="disabled")
         finally:
             self.root.after(600, self._tick)
 

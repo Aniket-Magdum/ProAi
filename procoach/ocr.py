@@ -34,12 +34,19 @@ def _preprocess(img: Image.Image, scale: int = 3) -> Image.Image:
 
 
 def read_image(img: Image.Image, scale: int = 3, fast: bool = False) -> str:
-    """OCR a PIL image, returning newline-joined text. Empty string on failure."""
+    """OCR a PIL image, returning newline-joined text. Empty string on failure.
+    Low-confidence lines (score < 0.35) are dropped - garbage reads stay out."""
     try:
         result, _ = _get_engine(fast)(np.asarray(_preprocess(img, int(scale))))
         if not result:
             return ""
-        return "\n".join(str(line[1]) for line in result).strip()
+        lines = []
+        for row in result:
+            text = str(row[1])
+            score = float(row[2]) if len(row) > 2 else 1.0
+            if score >= 0.35:
+                lines.append(text)
+        return "\n".join(lines).strip()
     except Exception:
         return ""
 

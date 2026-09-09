@@ -1,4 +1,8 @@
-"""Parses OCR'd battle-log lines into a live battle state (the scout sheet)."""
+"""Parses OCR'd battle-log lines into a live battle state (the scout sheet).
+
+Mons are stored SIDE-QUALIFIED ("my:venusaur" / "their:venusaur") so mirror
+matches (both players own the same species) never share scout data.
+"""
 import difflib
 import json
 import re
@@ -13,12 +17,9 @@ with open(DATA_DIR / "moves.json", encoding="utf8") as f:
 
 _NAME_INDEX = {e["name"].lower(): key for key, e in DEX.items()}
 _MOVE_INDEX = {e["name"].lower(): key for key, e in MOVES.items()}
-_NAME_ALIASES = {
-    "slowking galar": "slowkinggalar",
-    "slowking": "slowking",  # keep plain slowking distinct
-}
 
 RESOLVE_CACHE = {}
+_MOVE_CACHE = {}
 
 
 def _try_dex(text):
@@ -49,10 +50,15 @@ def resolve_move(text):
     if not text:
         return None
     t = text.strip().strip(".,!").lower()
+    if t in _MOVE_CACHE:
+        return _MOVE_CACHE[t]
     if t in _MOVE_INDEX:
-        return _MOVE_INDEX[t]
-    close = difflib.get_close_matches(t, list(_MOVE_INDEX), n=1, cutoff=0.85)
-    return _MOVE_INDEX[close[0]] if close else None
+        result = _MOVE_INDEX[t]
+    else:
+        close = difflib.get_close_matches(t, list(_MOVE_INDEX), n=1, cutoff=0.85)
+        result = _MOVE_INDEX[close[0]] if close else None
+    _MOVE_CACHE[t] = result
+    return result
 
 
 def new_mon(key, side=None):
@@ -72,23 +78,27 @@ def new_mon(key, side=None):
     }
 
 
+def _sid(side, key):
+    return f"{side}:{key}"
+
+
 class BattleState:
     STATE_FILE = DATA_DIR.parent / "battlestate.json"
 
     def __init__(self):
-        self.my_active_key = None
-        self.their_active_key = None
-        self.mons = {}          # dex key -> mon dict
+        self.my_active_key = None     # side-qualified id, e.g. "my:pikachu"
+        self.their_active_key = None  # e.g. "their:garchomp"
+        self.mons = {}                # sid -> mon dict
         self.turn = 0
-        self.events = []        # recent raw log lines (last 40)
-        self.menu_mode = None   # 'attack' | 'switch' | None
-        self.menu_moves = []    # move keys when attack menu open
-        self.my_fainted = []
-        self.their_fainted = []
-        self.my_hp = None       # 0.0..1.0 from bar scan
+        self.events = []              # recent raw log lines (last 40)
+        self.menu_mode = None         # 'attack' | 'switch' | None
+        self.menu_moves = []          # move keys when attack menu open
+        self.my_fainted = []          # sids
+        self.their_fainted = []       # sids
+        self.my_hp = None
         self.their_hp = None
         self._came_back = {"my": False, "their": False}
-        self.pending_switch = None   # set when my mon faints: "pick next"
+        self.pending_switch = None
         self.load()
 
     # ---------- persistence ----------
@@ -106,8 +116,9 @@ class BattleState:
                 "mons": self.mons,
             }
             self.STATE_FILE.write_text(json.dumps(data), encoding="utf8")
-        except Exception:
-            pass
+        except Exception as e:
+            from . import log_error
+            log_error(f"save failed: {e}")
 
     def load(self):
         try:
@@ -121,19 +132,20 @@ class BattleState:
         self.their_hp = data.get("their_hp")
         self.my_fainted = data.get("my_fainted", [])
         self.their_fainted = data.get("their_fainted", [])
-        for key, m in (data.get("mons") or {}).items():
-            if key in DEX:
-                m.setdefault("side", None)
-                self.mons[key] = m
+        for sid, m in (data.get("mons") or {}).items():
+            # side-qualified ids carry "my:"/"their:" - older formats are dropped
+            if ":" in sid and m.get("key") in DEX:
+                m.setdefault("side", sid.split(":", 1)[0])
+                self.mons[sid] = m
 
     def reset(self):
         self.my_active_key = None
         self.their_active_key = None
-        self.mons = {}          # dex key -> mon dict
+        self.mons = {}
         self.turn = 0
-        self.events = []        # recent raw log lines (last 40)
-        self.menu_mode = None   # 'attack' | 'switch' | None
-        self.menu_moves = []    # move keys when attack menu open
+        self.events = []
+        self.menu_mode = None
+        self.menu_moves = []
         self.my_fainted = []
         self.their_fainted = []
         self.my_hp = None
@@ -141,10 +153,38 @@ class BattleState:
         self._came_back = {"my": False, "their": False}
         self.pending_switch = None
 
-    def mon(self, key, side=None):
-        if key and key not in self.mons:
-            self.mons[key] = new_mon(key, side)
-        return self.mons.get(key)
+    def mon(self, sid, side=None):
+        if sid and sid not in self.mons:
+            dexkey = sid.split(":", 1)[1] if ":" in sid else sid
+            if dexkey in DEX:
+                self.mons[sid] = new_mon(dexkey, side)
+        return self.mons.get(sid)
+
+    def _active_dex_key(self, side):
+        sid = self.my_active_key if side == "my" else self.their_active_key
+        return self.mons.get(sid, {}).get("key") if sid else None
+
+    def _attr_sid(self, key, default_side=None):
+        """Attribute a side-unmarked log mention to a mon.
+        Returns sid or None when ambiguous (e.g. true mirror)."""
+        my_sid, th_sid = self.my_active_key, self.their_active_key
+        my_k = self._active_dex_key("my")
+        th_k = self._active_dex_key("their")
+        if key == my_k and key != th_k:
+            return my_sid
+        if key == th_k and key != my_k:
+            return th_sid
+        my_hit = [s for s, m in self.mons.items()
+                  if m.get("key") == key and m.get("side") == "my"]
+        th_hit = [s for s, m in self.mons.items()
+                  if m.get("key") == key and m.get("side") == "their"]
+        if my_hit and not th_hit:
+            return my_hit[0]
+        if th_hit and not my_hit:
+            return th_hit[0]
+        if default_side:
+            return _sid(default_side, key)
+        return None
 
     # ---------- log parsing ----------
 
@@ -164,7 +204,6 @@ class BattleState:
         m = re.match(r"battle turn #(\d+) ended", low)
         if m:
             n = int(m.group(1))
-            # new battle: turn counter dropped back to the start
             if self.turn and n < self.turn and n <= 2:
                 self.reset()
             self.turn = n
@@ -172,101 +211,70 @@ class BattleState:
 
         m = re.match(r"^(?:the opposing )?(.+?) sends out (.+?)!$", low)
         if not m:
-            # OCR-garbled variants: 'senos out', 'sends ot', 'sends ou'...
             m = re.match(r"^(?:the opposing )?(.+?) sen\w* o\w{0,2} (.+?)!$", low)
         if m:
-            key = resolve_mon(m.group(2))
-            if key:
-                old = self.their_active_key
-                if (
-                    old and old != key
-                    and not self._came_back["their"]
-                    and not self.mons.get(old, {}).get("fainted")
-                ):
-                    self.mons.setdefault(old, new_mon(old))["fainted"] = True
-                    if old not in self.their_fainted:
-                        self.their_fainted.append(old)
-                self.their_active_key = key
-                self.mon(key, side="their")
-                self.mons[key]["fainted"] = False   # sent out = alive
-                self._came_back["their"] = False
+            self._handle_send_out("their", m.group(2))
             return
 
         m = re.match(r"^go,? (.+?)!$", low)
         if m:
-            key = resolve_mon(m.group(1))
-            if key:
-                old = self.my_active_key
-                if (
-                    old and old != key
-                    and not self._came_back["my"]
-                    and not self.mons.get(old, {}).get("fainted")
-                ):
-                    self.mons.setdefault(old, new_mon(old))["fainted"] = True
-                    if old not in self.my_fainted:
-                        self.my_fainted.append(old)
-                self.my_active_key = key
-                self.mon(key, side="my")
-                self.mons[key]["fainted"] = False   # sent out = alive
-                self._came_back["my"] = False
-                self.pending_switch = None   # pick was made
+            self._handle_send_out("my", m.group(1))
             return
 
         m = re.match(r"^come back, (.+?)!$", low)
         if m:
             key = resolve_mon(m.group(1))
             if key:
-                if key == self.my_active_key:
+                sid = _sid("my", key)
+                sid_t = _sid("their", key)
+                if sid == self.my_active_key:
                     self.my_active_key = None
                     self._came_back["my"] = True
-                elif key == self.their_active_key:
+                elif sid_t == self.their_active_key:
                     self.their_active_key = None
                     self._came_back["their"] = True
             return
 
+        # attacks carry a reliable side marker ("The opposing X attacks ...")
         m = re.match(r"^(the opposing )?(.+?) attacks (?:the opposing )?(.+?) with (.+?)\.?$", low)
         if m:
-            attacker = resolve_mon(m.group(2))
+            side = "their" if m.group(1) else "my"
+            key = resolve_mon(m.group(2))
             move = resolve_move(m.group(4))
-            if attacker and move:
-                mon = self.mon(attacker)
-                if move not in mon["moves"]:
+            if key and move:
+                mon = self.mon(_sid(side, key), side)
+                if mon and move not in mon["moves"]:
                     mon["moves"].append(move)
             return
 
         m = re.match(r"^(?:the opposing )?(.+?) (?:has )?fainted", low)
         if m:
             key = resolve_mon(m.group(1))
-            if key:
-                self.mon(key)["fainted"] = True
-                if key == self.my_active_key:
-                    self.my_fainted.append(key)
-                    self.my_active_key = None
-                    self.pending_switch = key   # prompt switch pick NOW
-                elif key == self.their_active_key:
-                    self.their_fainted.append(key)
-                    self.their_active_key = None
+            self._handle_faint(key)
             return
 
         m = re.match(r"^(.+?) restored hp using (.+?)!$", low)
         if m:
             key = resolve_mon(m.group(1))
-            if key:
-                self.mon(key)["item"] = m.group(2).title()
+            sid = self._attr_sid(key)
+            if sid:
+                self.mons[sid]["item"] = m.group(2).title()
             return
 
         m = re.match(r"^(.+?) knocked off (?:the opposing )?(.+?)'s (.+?)!$", low)
         if m:
             key = resolve_mon(m.group(2))
-            if key:
-                self.mon(key)["item"] = m.group(3).title() + " (knocked off)"
+            sid = self._attr_sid(key)
+            if sid:
+                self.mons[sid]["item"] = m.group(3).title() + " (knocked off)"
             return
 
         m = re.match(r"^(.+?) was hurt by (.+?)!$", low)
         if m:
             key = resolve_mon(m.group(1))
-            if key and "orb" in m.group(2) or "life orb" in m.group(2):
-                self.mon(key)["item"] = "Life Orb"
+            sid = self._attr_sid(key)
+            if sid and ("orb" in m.group(2) or "life orb" in m.group(2)):
+                self.mons[sid]["item"] = "Life Orb"
             return
 
         m = re.match(r"^(.+?)'s (.+?)!$", low)
@@ -274,57 +282,104 @@ class BattleState:
             key = resolve_mon(m.group(1))
             what = m.group(2)
             if key:
-                mon = self.mon(key)
-                if "rose" in what or "fell" in what:
-                    pass  # stat stages: noted via effectiveness anyway
-                elif not any(
+                sid = self._attr_sid(key)
+                if sid and "rose" not in what and "fell" not in what and not any(
                     w in what for w in
-                    ("was", "is", "were", "disabled", "sharply", "drastically", "hinted", "rose", "fell")
+                    ("was", "is", "were", "disabled", "sharply", "drastically", "hinted")
                 ) and 1 <= len(what.split()) <= 3:
-                    mon["ability"] = what.title()
+                    self.mons[sid]["ability"] = what.title()
             return
 
         m = re.match(r"^(.+?) (?:was|is|became) (badly )?poisoned", low)
         if m:
-            key = resolve_mon(m.group(1))
-            if key:
-                self.mon(key)["status"] = "TOX" if m.group(2) else "PSN"
+            sid = self._attr_sid(resolve_mon(m.group(1)))
+            if sid:
+                self.mons[sid]["status"] = "TOX" if m.group(2) else "PSN"
             return
 
         m = re.match(r"^(.+?) was (paralyzed|burned|frozen)", low)
         if m:
-            key = resolve_mon(m.group(1))
-            if key:
-                self.mon(key)["status"] = m.group(2)[:3].upper()
+            sid = self._attr_sid(resolve_mon(m.group(1)))
+            if sid:
+                self.mons[sid]["status"] = m.group(2)[:3].upper()
             return
 
         m = re.match(r"^(.+?) fell asleep", low)
         if m:
-            key = resolve_mon(m.group(1))
-            if key:
-                self.mon(key)["status"] = "SLP"
+            sid = self._attr_sid(resolve_mon(m.group(1)))
+            if sid:
+                self.mons[sid]["status"] = "SLP"
             return
 
-        m = re.match(r"^(.+?) (?:woke up|thawed out|snapped out of its confusion)!", low)
+        m = re.match(r"^(.+?) (?:woke up|thawed out|snapped out of its confusion)", low)
         if m:
-            key = resolve_mon(m.group(1))
-            if key:
-                self.mon(key)["status"] = None
+            sid = self._attr_sid(resolve_mon(m.group(1)))
+            if sid:
+                self.mons[sid]["status"] = None
             return
 
         m = re.match(r"^(.+?) was seeded!$", low)
         if m:
-            key = resolve_mon(m.group(1))
-            if key:
-                self.mon(key)["seeded"] = True
+            sid = self._attr_sid(resolve_mon(m.group(1)))
+            if sid:
+                self.mons[sid]["seeded"] = True
             return
 
+    def _handle_send_out(self, side, name_text):
+        key = resolve_mon(name_text)
+        if not key:
+            return
+        sid = _sid(side, key)
+        old = self.my_active_key if side == "my" else self.their_active_key
+        if old and old != sid and not self._came_back[side] \
+                and not self.mons.get(old, {}).get("fainted"):
+            self.mons.setdefault(old, new_mon(old.split(":", 1)[1], side))["fainted"] = True
+            fl = self.my_fainted if side == "my" else self.their_fainted
+            if old not in fl:
+                fl.append(old)
+        if side == "my":
+            self.my_active_key = sid
+        else:
+            self.their_active_key = sid
+        m = self.mon(sid, side)
+        if m:
+            m["fainted"] = False   # sent out = alive
+        self._came_back[side] = False
+
+    def _handle_faint(self, key):
+        if not key:
+            return
+        my_sid, th_sid = self.my_active_key, self.their_active_key
+        my_k = self._active_dex_key("my")
+        th_k = self._active_dex_key("their")
+        # mirror matches: both actives share the dex key - attribute mine first
+        if key == my_k:
+            sid = my_sid
+        elif key == th_k:
+            sid = th_sid
+        else:
+            sid = self._attr_sid(key)
+        if not sid:
+            return
+        self.mons.setdefault(sid, new_mon(key, sid.split(":", 1)[0]))["fainted"] = True
+        if sid == self.my_active_key:
+            if sid not in self.my_fainted:
+                self.my_fainted.append(sid)
+            self.my_active_key = None
+            self.pending_switch = sid
+        elif sid == self.their_active_key:
+            if sid not in self.their_fainted:
+                self.their_fainted.append(sid)
+            self.their_active_key = None
+
+    # ---------- party panel ----------
+
     def register_party(self, text):
-        """Parse party-panel OCR: name/level lines. The panel is ground truth:
-        bench mons not on it are stale ghosts from a previous battle."""
+        """Parse party-panel OCR: name/level lines. The panel is ground truth."""
         if not text:
             return
         seen = []
+        roster = []   # (key, level or None) in panel order
         current = None
         for raw in text.splitlines():
             line = raw.strip()
@@ -335,28 +390,39 @@ class BattleState:
             key = resolve_mon(core) if len(core) >= 3 else None
             if key:
                 current = key
-                m = self.mon(key, side="my")
-                seen.append(key)
-            elif lm and current:
+                roster.append([key, None])
+                seen.append(_sid("my", key))
+            elif lm and current is not None and roster:
                 lvl = int(lm.group(1))
-                while lvl > 100:  # OCR merges ('810' -> 81)
+                while lvl > 100:
                     lvl = int(str(lvl)[:-1])
                 if 1 <= lvl <= 100:
-                    self.mons[current]["level"] = lvl
+                    roster[-1][1] = lvl
                     current = None
+
+        # a full panel of mons we've never seen = a new battle the turn-reset
+        # missed (e.g. coach started mid-queue): wipe stale state
+        known_my = [s for s, m in self.mons.items() if m.get("side") == "my"]
+        if len(seen) >= 4 and known_my and not (set(known_my) & set(seen)):
+            self.reset()
+
+        for key, lvl in roster:
+            sid = _sid("my", key)
+            m = self.mon(sid, "my")
+            if m and lvl:
+                m["level"] = lvl
+
         # prune ghosts: alive 'my' mons not in the current panel
+        # (never the active mon - a garbled panel read must not wipe its scout data)
         for key in [k for k, m in self.mons.items()
-                    if m.get("side") == "my" and not m.get("fainted") and k not in seen]:
+                    if m.get("side") == "my" and not m.get("fainted")
+                    and k not in seen and k != self.my_active_key]:
             del self.mons[key]
 
     # ---------- field nameplates ----------
 
     def set_field_active(self, side, text):
-        """Authoritative active-mon override from the on-field HP nameplate.
-
-        Text looks like 'Slowking Lv 84' / 'Thundurus Lv.80'. Returns True if
-        a species was resolved.
-        """
+        """Authoritative active-mon override from the on-field HP nameplate."""
         if not text:
             return False
         raw = text.strip()
@@ -369,14 +435,10 @@ class BattleState:
         key = resolve_mon(name_part)
         if not key:
             return False
-        if side == "my":
-            old = self.my_active_key
-        else:
-            old = self.their_active_key
-        # replacement without a logged "Come back" = the old mon fainted
-        # (faint line missed by OCR); heals if it ever re-enters the field
+        sid = _sid(side, key)
+        old = self.my_active_key if side == "my" else self.their_active_key
         came_back = self._came_back[side]
-        if old and old != key and not came_back:
+        if old and old != sid and not came_back:
             om = self.mons.get(old)
             if om and not om.get("fainted"):
                 om["fainted"] = True
@@ -384,13 +446,14 @@ class BattleState:
                 if old not in fl:
                     fl.append(old)
         if side == "my":
-            self.my_active_key = key
+            self.my_active_key = sid
         else:
-            self.their_active_key = key
-        m = self.mon(key, side=side)
-        m["fainted"] = False   # on the field = alive, self-heal wrong marks
-        if level:
-            m["level"] = level
+            self.their_active_key = sid
+        m = self.mon(sid, side)
+        if m:
+            m["fainted"] = False   # on the field = alive, self-heal wrong marks
+            if level:
+                m["level"] = level
         return True
 
     # ---------- menu parsing ----------
@@ -413,20 +476,11 @@ class BattleState:
 
     # ---------- summary ----------
 
-    def score(self):
-        their_total = len({k for k, m in self.mons.items()}) - len(self.my_fainted)
-        # fallback: we only know mons we've seen
-        mine_alive = 6 - len(self.my_fainted) if self.my_fainted else None
-        return mine_alive, len(self.their_fainted)
-
     def state_line(self, advice):
-        def nm(key):
-            return self.mons[key]["name"] if key in self.mons else (key or "?")
-
-        def tag(key):
-            m = self.mons.get(key)
+        def tag(sid):
+            m = self.mons.get(sid)
             if not m:
-                return key or "?"
+                return sid or "?"
             bits = [m["name"], f"{m['level']}"]
             if m.get("status"):
                 bits.append(f"[{m['status']}]")
@@ -436,18 +490,24 @@ class BattleState:
                 bits.append("[SEEDED]")
             return " ".join(bits)
 
-        my = self.mon(self.my_active_key) if self.my_active_key else None
-        th = self.mon(self.their_active_key) if self.their_active_key else None
+        my = self.mons.get(self.my_active_key)
+        th = self.mons.get(self.their_active_key)
         lines = []
         lines.append(f"TURN {self.turn} | menu: {self.menu_mode or '-'}")
         hp_s = f" ~{int(self.my_hp*100)}%" if self.my_hp is not None else ""
         thp_s = f" ~{int(self.their_hp*100)}%" if self.their_hp is not None else ""
-        lines.append(f"MY ACTIVE: {tag(self.my_active_key) + hp_s + ' (' + '/'.join(my['types']) + ')' if my else '-'}")
-        lines.append(f"THEIR ACTIVE: {tag(self.their_active_key) + thp_s + ' (' + '/'.join(th['types']) + ')' if th else '-'}")
+        if my:
+            lines.append(f"MY ACTIVE: {tag(self.my_active_key)}{hp_s} ({'/'.join(my['types'])})")
+        else:
+            lines.append("MY ACTIVE: -")
+        if th:
+            lines.append(f"THEIR ACTIVE: {tag(self.their_active_key)}{thp_s} ({'/'.join(th['types'])})")
+        else:
+            lines.append("THEIR ACTIVE: -")
         bench = [
             tag(k)
             for k, m in self.mons.items()
-            if m.get("side") == "my" and k not in (self.my_active_key,) and not m.get("fainted")
+            if m.get("side") == "my" and k != self.my_active_key and not m.get("fainted")
         ]
         if bench:
             lines.append("MY BENCH: " + " | ".join(bench))
@@ -456,23 +516,22 @@ class BattleState:
         if th and th["moves"]:
             lines.append("THEIR REVEALED MOVES: " + ", ".join(MOVES[mk]["name"] for mk in th["moves"]))
         scout = []
-        for key, m in self.mons.items():
+        for sid, m in self.mons.items():
             tags = []
-            if m["ability"]:
+            if m.get("ability"):
                 tags.append(f"ability {m['ability']}")
-            if m["item"]:
+            if m.get("item"):
                 tags.append(f"item {m['item']}")
-            if m["seeded"]:
+            if m.get("seeded"):
                 tags.append("LEECH SEEDED")
             if tags:
                 scout.append(f"{m['name']}: " + ", ".join(tags))
         if scout:
             lines.append("SCOUT: " + " || ".join(scout[-8:]))
         if self.my_fainted or self.their_fainted:
-            lines.append(
-                f"FAINTED mine: {', '.join(nm(k) for k in self.my_fainted) or '-'}"
-                f" | theirs: {', '.join(nm(k) for k in self.their_fainted) or '-'}"
-            )
+            fmine = ", ".join(tag(k) for k in self.my_fainted) or "-"
+            ftheirs = ", ".join(tag(k) for k in self.their_fainted) or "-"
+            lines.append(f"FAINTED mine: {fmine} | theirs: {ftheirs}")
         if advice:
             lines.append("ADVICE: " + advice)
         return "\n".join(lines)
