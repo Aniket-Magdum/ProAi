@@ -93,8 +93,13 @@ def ko_chance(dmg, their_hp):
 
 def effective_speed(mon):
     base = mon.get("base_spe", 80)
-    s = stat_est(base, mon["level"])
+    s = float(stat_est(base, mon["level"]))
+    stage = mon.get("speed_stage", 0) or 0
+    if stage > 0:
+        s *= (2 + stage) / 2
+    elif stage < 0:
+        s *= 2 / (2 - stage)
     item = (mon.get("item") or "").lower().replace(" ", "")
     if "choicescarf" in item:
-        s = int(s * 1.5)
-    return s
+        s *= 1.5
+    return int(s)

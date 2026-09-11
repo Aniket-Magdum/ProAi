@@ -1,6 +1,9 @@
 """Finds the PROClient window and captures the battle-log / menu regions."""
+import ctypes
+
 import mss
 import win32gui
+import win32process
 from PIL import Image
 
 # Regions as fractions of the client area, measured on the default layout
@@ -13,14 +16,49 @@ REGIONS = {
 }
 
 
+def _process_exe(hwnd):
+    """Executable path of the window's owning process, or None if unqueryable."""
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+    except Exception:
+        return None
+    try:
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(512)
+            size = ctypes.c_ulong(512)
+            if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return buf.value
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        return None
+    return None
+
+
 def find_pro_hwnd():
+    """Title match + process verification.
+
+    Many windows can contain 'proclient' in their title (a file-explorer folder,
+    a browser tab, a chat) - reading those pixels poisons every OCR read. A
+    candidate is only accepted when its owning process is actually
+    PROClient.exe; when the process can't be queried we fall back to the
+    title-only match (old behavior) rather than refusing the real game."""
     found = []
 
     def cb(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd):
-            title = (win32gui.GetWindowText(hwnd) or "").lower()
-            if "proclient" in title:
-                found.append(hwnd)
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        title = (win32gui.GetWindowText(hwnd) or "").lower()
+        if "proclient" not in title:
+            return
+        exe = _process_exe(hwnd)
+        if exe is not None and not exe.lower().endswith("proclient.exe"):
+            return   # confirmed impostor (explorer/browser/chat with a matching title)
+        found.append(hwnd)
 
     win32gui.EnumWindows(cb, None)
     return found[0] if found else None

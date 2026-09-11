@@ -14,12 +14,50 @@ with open(DATA_DIR / "dex.json", encoding="utf8") as f:
     DEX = json.load(f)
 with open(DATA_DIR / "moves.json", encoding="utf8") as f:
     MOVES = json.load(f)
+try:
+    with open(DATA_DIR / "items.json", encoding="utf8") as f:
+        _ITEMS = json.load(f)
+    ITEM_INDEX = {e["name"].lower(): e["name"] for e in _ITEMS.values()}
+except Exception:
+    ITEM_INDEX = {}
+try:
+    with open(DATA_DIR / "learnsets.json", encoding="utf8") as f:
+        LEARNSETS = json.load(f)
+except Exception:
+    LEARNSETS = {}
+
+
+def moves_in_learnset(key, moves):
+    """Filters a scanned move list down to what the species can actually learn.
+
+    The team scanner OCRs whatever is on screen; without this gate one popup's
+    moves get attributed to the wrong species. A species with no learnset entry
+    (data gap) is passed through unfiltered."""
+    learn = LEARNSETS.get(key)
+    if not learn:
+        return list(moves)
+    return [mv for mv in moves if mv in learn]
+
+
+def match_item(text):
+    """Finds an item name inside an OCR line (PvP team scans)."""
+    if not text:
+        return None
+    t = text.lower()
+    for low, disp in ITEM_INDEX.items():
+        if len(low) > 4 and low in t:
+            return disp
+    close = difflib.get_close_matches(
+        t.strip().strip(".,!"), list(ITEM_INDEX), n=1, cutoff=0.85
+    )
+    return ITEM_INDEX[close[0]] if close else None
 
 _NAME_INDEX = {e["name"].lower(): key for key, e in DEX.items()}
 _MOVE_INDEX = {e["name"].lower(): key for key, e in MOVES.items()}
 
-RESOLVE_CACHE = {}
-_MOVE_CACHE = {}
+RESOLVE_CACHE = {}  # capped at 5000 entries
+_MOVE_CACHE = {}    # capped at 5000 entries
+_CACHE_CAP = 5000
 
 
 def _try_dex(text):
@@ -42,6 +80,8 @@ def resolve_mon(text, cache=RESOLVE_CACHE):
     if low in cache:
         return cache[low]
     key = _try_dex(t)
+    if len(cache) >= _CACHE_CAP:
+        cache.clear()
     cache[low] = key
     return key
 
@@ -57,6 +97,8 @@ def resolve_move(text):
     else:
         close = difflib.get_close_matches(t, list(_MOVE_INDEX), n=1, cutoff=0.85)
         result = _MOVE_INDEX[close[0]] if close else None
+    if len(_MOVE_CACHE) >= _CACHE_CAP:
+        _MOVE_CACHE.clear()
     _MOVE_CACHE[t] = result
     return result
 
@@ -74,6 +116,7 @@ def new_mon(key, side=None):
         "seeded": False,
         "fainted": False,
         "status": None,
+        "speed_stage": 0,
         "side": side,
     }
 
@@ -97,8 +140,13 @@ class BattleState:
         self.their_fainted = []       # sids
         self.my_hp = None
         self.their_hp = None
+        self.my_hp_prev = None        # last tick's bar reading (pre-replacement HP)
+        self.their_hp_prev = None
         self._came_back = {"my": False, "their": False}
         self.pending_switch = None
+        self._last_my_active = None      # remembered through "Come back" clears
+        self._last_their_active = None
+        self.my_team_data = {}           # pre-battle scans: dexkey -> moves/item/level
         self.load()
 
     # ---------- persistence ----------
@@ -114,6 +162,7 @@ class BattleState:
                 "my_fainted": self.my_fainted,
                 "their_fainted": self.their_fainted,
                 "mons": self.mons,
+                "my_team_data": self.my_team_data,
             }
             self.STATE_FILE.write_text(json.dumps(data), encoding="utf8")
         except Exception as e:
@@ -137,6 +186,9 @@ class BattleState:
             if ":" in sid and m.get("key") in DEX:
                 m.setdefault("side", sid.split(":", 1)[0])
                 self.mons[sid] = m
+        for key, d in (data.get("my_team_data") or {}).items():
+            if key in DEX:
+                self.my_team_data[key] = d
 
     def reset(self):
         self.my_active_key = None
@@ -150,6 +202,8 @@ class BattleState:
         self.their_fainted = []
         self.my_hp = None
         self.their_hp = None
+        self.my_hp_prev = None
+        self.their_hp_prev = None
         self._came_back = {"my": False, "their": False}
         self.pending_switch = None
 
@@ -247,6 +301,18 @@ class BattleState:
                     mon["moves"].append(move)
             return
 
+        # "X used Y" lines reveal status/setup moves (Swords Dance, Dragon Dance...)
+        m = re.match(r"^(the opposing )?(.+?) used (.+?)\.?$", low)
+        if m:
+            side = "their" if m.group(1) else "my"
+            key = resolve_mon(m.group(2))
+            move = resolve_move(m.group(3))
+            if key and move:
+                mon = self.mon(_sid(side, key), side)
+                if mon and move not in mon["moves"]:
+                    mon["moves"].append(move)
+            return
+
         m = re.match(r"^(?:the opposing )?(.+?) (?:has )?fainted", low)
         if m:
             key = resolve_mon(m.group(1))
@@ -258,7 +324,8 @@ class BattleState:
             key = resolve_mon(m.group(1))
             sid = self._attr_sid(key)
             if sid:
-                self.mons[sid]["item"] = m.group(2).title()
+                matched = match_item(m.group(2))
+                self.mons[sid]["item"] = matched if matched else m.group(2).title()
             return
 
         m = re.match(r"^(.+?) knocked off (?:the opposing )?(.+?)'s (.+?)!$", low)
@@ -275,6 +342,20 @@ class BattleState:
             sid = self._attr_sid(key)
             if sid and ("orb" in m.group(2) or "life orb" in m.group(2)):
                 self.mons[sid]["item"] = "Life Orb"
+            return
+
+        m = re.match(r"^(?:the opposing )?(.+?)'s speed (?:sharply |drastically )?(rose|fell)", low)
+        if m:
+            key = resolve_mon(m.group(1))
+            sid = self._attr_sid(key)
+            if sid:
+                mon = self.mons[sid]
+                up = m.group(2) == "rose"
+                mag = 2 if ("sharply" in low or "drastically" in low) else 1
+                if up:
+                    mon["speed_stage"] = min(6, mon.get("speed_stage", 0) + mag)
+                else:
+                    mon["speed_stage"] = max(-6, mon.get("speed_stage", 0) - mag)
             return
 
         m = re.match(r"^(.+?)'s (.+?)!$", low)
@@ -339,11 +420,16 @@ class BattleState:
                 fl.append(old)
         if side == "my":
             self.my_active_key = sid
+            self._last_my_active = sid
         else:
             self.their_active_key = sid
+            self._last_their_active = sid
         m = self.mon(sid, side)
         if m:
             m["fainted"] = False   # sent out = alive
+            m["speed_stage"] = 0   # fresh entry = no stat stages
+            if side == "my":
+                self._apply_team_data(key)
         self._came_back[side] = False
 
     def _handle_faint(self, key):
@@ -411,6 +497,8 @@ class BattleState:
             m = self.mon(sid, "my")
             if m and lvl:
                 m["level"] = lvl
+            if m:
+                self._apply_team_data(key)   # scanned moves/items merge in
 
         # prune ghosts: alive 'my' mons not in the current panel
         # (never the active mon - a garbled panel read must not wipe its scout data)
@@ -418,6 +506,45 @@ class BattleState:
                     if m.get("side") == "my" and not m.get("fainted")
                     and k not in seen and k != self.my_active_key]:
             del self.mons[key]
+
+    # ---------- pre-battle team scans (PvP mode) ----------
+
+    def register_scanned(self, key, moves=None, item=None, level=None):
+        """Stores a scanned team member. Survives battle resets; merged into
+        the mon's live entry the moment it enters a battle.
+
+        Gates: moves the species cannot learn are dropped (OCR cross-reads),
+        and an entry with no usable data at all is not stored."""
+        if not key or key not in DEX:
+            return
+        clean_moves = moves_in_learnset(key, [mv for mv in (moves or []) if mv in MOVES])
+        if not clean_moves and not item and not level:
+            return
+        d = self.my_team_data.setdefault(key, {"moves": [], "item": None, "level": None})
+        for mv in clean_moves:
+            if mv not in d["moves"] and len(d["moves"]) < 6:
+                d["moves"].append(mv)
+        if item:
+            d["item"] = item
+        if level and 1 <= level <= 100:
+            d["level"] = level
+        self._apply_team_data(key)
+        self.save()
+
+    def _apply_team_data(self, key):
+        d = self.my_team_data.get(key)
+        if not d:
+            return
+        m = self.mons.get(_sid("my", key))
+        if not m:
+            return
+        for mv in d["moves"]:
+            if mv not in m["moves"]:
+                m["moves"].append(mv)
+        if d["item"] and not m.get("item"):
+            m["item"] = d["item"]
+        if d["level"] and (not m.get("level") or m.get("level") == 80):
+            m["level"] = d["level"]
 
     # ---------- field nameplates ----------
 
@@ -436,19 +563,28 @@ class BattleState:
         if not key:
             return False
         sid = _sid(side, key)
-        old = self.my_active_key if side == "my" else self.their_active_key
+        old = (self.my_active_key if side == "my" else self.their_active_key) \
+            or (self._last_my_active if side == "my" else self._last_their_active)
+        pre_hp = self.my_hp_prev if side == "my" else self.their_hp_prev
         came_back = self._came_back[side]
-        if old and old != sid and not came_back:
+        if old and old != sid:
             om = self.mons.get(old)
             if om and not om.get("fainted"):
-                om["fainted"] = True
-                fl = self.my_fainted if side == "my" else self.their_fainted
-                if old not in fl:
-                    fl.append(old)
+                # replaced without Come back = faint. With Come back: PRO also
+                # recalls fainted mons, so use last-seen HP - a weak mon that
+                # leaves was almost certainly KO'd, a healthy one was pivoted.
+                likely_fainted = (not came_back) or (pre_hp is not None and pre_hp <= 0.45)
+                if likely_fainted:
+                    om["fainted"] = True
+                    fl = self.my_fainted if side == "my" else self.their_fainted
+                    if old not in fl:
+                        fl.append(old)
         if side == "my":
             self.my_active_key = sid
+            self._last_my_active = sid
         else:
             self.their_active_key = sid
+            self._last_their_active = sid
         m = self.mon(sid, side)
         if m:
             m["fainted"] = False   # on the field = alive, self-heal wrong marks

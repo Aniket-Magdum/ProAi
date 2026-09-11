@@ -91,12 +91,20 @@ def main():
         if lm:
             learnsets[key] = lm
 
+    items_raw = extract_entries((DATA_DIR / "items.ts").read_text(encoding="utf8"))
+    items = {}
+    for key, block in items_raw.items():
+        name = grab_str(block, "name")
+        if name:
+            items[key] = {"name": name}
+
     (DATA_DIR / "dex.json").write_text(json.dumps(dex, indent=0), encoding="utf8")
     (DATA_DIR / "moves.json").write_text(json.dumps(moves, indent=0), encoding="utf8")
     (DATA_DIR / "learnsets.json").write_text(json.dumps(learnsets, indent=0), encoding="utf8")
+    (DATA_DIR / "items.json").write_text(json.dumps(items, indent=0), encoding="utf8")
     print(
         f"dex.json: {len(dex)} species | moves.json: {len(moves)} moves | "
-        f"learnsets.json: {len(learnsets)} species"
+        f"learnsets.json: {len(learnsets)} species | items.json: {len(items)} items"
     )
 
 

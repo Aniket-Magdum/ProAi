@@ -33,8 +33,11 @@ ENV/
 env.bak/
 venv.bak/
 
-# Runtime locks and cache
+# Runtime locks, state, and logs
 coach.lock
+state.txt
+battlestate.json
+coach_errors.log
 
 # IDEs and editors
 .idea/

@@ -35,7 +35,6 @@ STAPLES = {
 
 # type chart + effectiveness live in calc.py (shared with the damage calc)
 CHART = calc.TYPE_CHART
-effectiveness = calc.effectiveness
 
 
 def est_speed(base_spe, level):
@@ -394,6 +393,15 @@ def advise(state):
                     mark += "?"
                 names.append(mark)
             out.append(("info", f"THEIR LIKELY MOVES: {', '.join(names)}"))
+
+    # their active boosted Speed past ours (Dragon Dance, Agility...) - recheck trades
+    if my and th and (th.get("speed_stage", 0) or 0) > 0:
+        if calc.effective_speed(th) > calc.effective_speed(my):
+            out.append((
+                "beware",
+                f"THEY BOOSTED SPEED (+{th['speed_stage']}) - {th['name']} outspeeds "
+                f"{my['name']} now; don't count on hitting first",
+            ))
 
     # switch advice: on the switch screen OR right after my faint
     if th and (state.menu_mode == "switch" or state.pending_switch):

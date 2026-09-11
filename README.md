@@ -74,7 +74,7 @@ advisor.py + calc.py — instant rules engines (no AI, <1ms):
 pro-coach/
 ├── run_coach.bat            # double-click launcher (overlay, below-normal CPU priority)
 ├── main.py                  # tick loop: capture → read → state → advise → overlay/state.txt
-├── test_all.py              # 31-check self-test suite (replays real log lines)
+├── test_all.py              # 42-check self-test suite (replays real log lines)
 ├── bench_ticks.py           # measures real per-tick latency on this machine
 ├── bench_ocr2.py            # compares OCR engine configs on live pixels
 ├── capture_samples.py       # snapshots live regions to data/samples/ + engine comparison
@@ -96,6 +96,7 @@ pro-coach/
     ├── moves.json           # 953 moves: type, power, category, accuracy
     ├── learnsets.json       # 1233 species: full learnable move pools
     ├── smogon_sets.json     # 555 species: real usage freq for moves/items/abilities
+    ├── items.json           # 583 items (held-item recognition for PvP scans)
     ├── samples/             # live-captured region PNGs (OCR regression fixtures)
     └── *.ts                 # raw Showdown sources (kept for rebuilds)
 ```
@@ -129,6 +130,17 @@ pip install mss pillow pywin32 rapidocr-onnxruntime
 next to the game window: **drag the title bar to move it, drag the ⛶ corner grip to
 resize, ✕ closes it**. A lock file (`coach.lock`) refuses a second instance.
 
+**Two modes (toggle on the overlay's bottom bar):**
+- **RANDOM** — default; random-ranked battles where your team is unknown until seen
+- **PVP** — for your own-team battles. Before queueing, click **SCAN TEAM** and open
+  each Pokemon's detail page (Trainer menu): the coach OCRs species, moves, held item
+  and level for each one (counts up `n/6`, 150s window). Scanned data **survives
+  battle resets** and merges into each mon's scout entry the moment it enters a
+  battle — so outcome branches use your real moves/items/levels from turn 1.
+  **CLEAR** wipes all scanned team data (use it after a bad scan session).
+  Scans only register when the game window is **in front** and the read is complete
+  (name + level + learnset-legal moves) — moves the species can't learn are dropped.
+
 **The three rules:**
 1. Keep the PRO window **visible** — the coach reads physical screen pixels (closing or
    covering the game flips the overlay to "PROClient not found" / "no battle on screen"
@@ -140,8 +152,10 @@ resize, ✕ closes it**. A lock file (`coach.lock`) refuses a second instance.
 `python procoach/parse_data.py` then `python fetch_smogon.py`
 
 **Self-test:** `python test_all.py` — replays real battle-log lines through the whole
-stack (parsing, faint inference, dead-switch inference, new-battle reset, damage calc,
-KO branching, scarf detection, switch ranking, Smogon predictions, persistence). 31 checks.
+stack (parsing, mirror matches, faint inference, dead-switch inference, speed stages,
+low-HP recalls, new-battle reset, damage calc, KO branching, scarf detection, switch
+ranking, Smogon predictions, PvP scan persistence, scan learnset-gating, garbled OCR
+header recovery, persistence). 42 checks.
 
 ---
 
@@ -223,6 +237,16 @@ optimization.
 - **Always validate OCR changes on real captures**: the synthetic-text benchmark said
   scale-1 was fine; live PRO text proved it drops send-out lines. `capture_samples.py`
   exists so no OCR setting ships without a live-pixel check
+- **Window matching must verify the process, not the title**: any window can contain
+  "proclient" in its title (a file-explorer folder, a browser tab, a chat) — EnumWindows
+  returns the topmost first, so an impostor in the foreground silently poisoned every
+  OCR read, and the team scanner stored its text as "scans". Candidates are now only
+  accepted when their owning process is PROClient.exe; the scanner additionally refuses
+  to read while another window covers the game
+- **Scanned moves must be learnset-legal**: one popup's move list used to be attributed
+  to whichever name the OCR saw (party-panel neighbors included) — Jolteon "knew"
+  Toxapex's set. Registration now requires name + level + at least one learnset-valid
+  move, and illegal moves are dropped at parse AND storage time
 - The overlay UI must never block on OCR → capture/read runs on a **worker thread**;
   advice lines are **prioritized** (action first) and persist until superseded
 
@@ -252,6 +276,13 @@ optimization.
       even lower latency on weak hardware
 
 **Done recently**
+- ✅ Window identification hardened: title match + PROClient.exe process verification
+  (impostor windows with "proclient" in the title can no longer poison OCR reads)
+- ✅ Team-scan hardening: learnset move-gate, complete-read registration gate
+  (name+level+move), quality OCR engine for the popup, foreground-only reads,
+  CLEAR button to wipe scan data
+- ✅ Test suite isolated from real state (temp battlestate.json) — running tests no
+  longer writes test scans into live data
 - ✅ Overlay drag/resize/close; single-instance lock; game-closed/zombie-state detection
 - ✅ Faint-triggered instant switch picks, advice persistence + priority sorting
 - ✅ Dead-switch inference (field replacement without Come back = faint) + self-heal
@@ -260,6 +291,17 @@ optimization.
 - ✅ Noise gate: BEWARE only fires on real threats; predictions capped to top 3
 - ✅ Stale-intel fix: presence requires real state changes (chat keywords can't fake it)
 - ✅ Live-sample fixture library (`capture_samples.py`) for OCR regression testing
+- ✅ Mirror-match refactor: side-qualified mons (`my:x`/`their:x`) — same species
+      on both sides never share scout data; ambiguous lines attribute to nobody
+- ✅ Full external audit applied: crash fix (Life Orb), fainted dedupe, NumPy HP
+      scan, per-line colored overlay, atexit lock cleanup, error log,
+      `requirements.txt`, OCR confidence floor
+- ✅ Speed stages: "Speed rose/fell" tracked (Dragon Dance/Agility), stage-aware
+      speed math + explicit THEY BOOSTED SPEED warning; "X used Y" setup-move scouting
+- ✅ Low-HP recall = faint inference (dead mons never recommended, even when PRO's
+      Come back after KO suppressed the old signal)
+- ✅ PvP mode + SCAN TEAM: pre-battle team scans (species/moves/item/level) that
+      survive resets and merge on entry; items DB (583) added
 
 **Explicitly not planned**
 - Any input automation / auto-playing (botting = ban risk; read-only coach by design)

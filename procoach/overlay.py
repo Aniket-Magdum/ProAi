@@ -14,7 +14,8 @@ MIN_W, MIN_H = 240, 150
 
 
 class Overlay:
-    def __init__(self, pro_rect, on_tick):
+    def __init__(self, pro_rect, on_tick, on_mode=None, on_scan=None, on_clear=None,
+                 get_mode=None, get_scan=None):
         self.root = tk.Tk()
         self.root.title("PRO Instant Coach")
         self.root.overrideredirect(True)
@@ -41,26 +42,62 @@ class Overlay:
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: self.root.destroy())
 
-        self.body = tk.Text(
-            self.root, bg="#0d1117", fg="#CCCCCC", bd=0,
-            highlightthickness=0, font=("Consolas", 10),
-            state="disabled", wrap="word",
+        # --- callbacks ---
+        self._on_tick = on_tick
+        self.on_mode = on_mode
+        self.on_scan = on_scan
+        self.on_clear = on_clear
+        self.get_mode = get_mode or (lambda: "random")
+        self.get_scan = get_scan or (lambda: "")
+
+        # control bar: mode toggle + team scanner (PvP mode)
+        # MUST be packed before the body so tkinter reserves space at bottom
+        ctrl = tk.Frame(self.root, bg="#161b22")
+        ctrl.pack(side="bottom", fill="x")
+        self.mode_btn = tk.Label(
+            ctrl, text="MODE: RANDOM", fg="#8AB4FF", bg="#161b22",
+            font=("Consolas", 9, "bold"), cursor="hand2", padx=6,
         )
-        self.body.pack(fill="both", expand=True, padx=8, pady=(4, 18))
-        for cat, col in COLORS.items():
-            self.body.tag_configure(cat, foreground=col)
+        self.mode_btn.pack(side="left")
+        self.mode_btn.bind("<Button-1>", lambda e: self.on_mode and self.on_mode())
+        self.scan_btn = tk.Label(
+            ctrl, text="SCAN TEAM", fg="#7CFC00", bg="#161b22",
+            font=("Consolas", 9, "bold"), cursor="hand2", padx=6,
+        )
+        self.scan_btn.pack(side="left")
+        self.scan_btn.bind("<Button-1>", lambda e: self.on_scan and self.on_scan())
+        self.clear_btn = tk.Label(
+            ctrl, text="CLEAR", fg="#FF6B6B", bg="#161b22",
+            font=("Consolas", 9, "bold"), cursor="hand2", padx=6,
+        )
+        self.clear_btn.pack(side="left")
+        self.clear_btn.bind("<Button-1>", lambda e: self.on_clear and self.on_clear())
+        self.scan_status = tk.Label(
+            ctrl, text="", fg="#8B949E", bg="#161b22",
+            font=("Consolas", 8), anchor="w",
+        )
+        self.scan_status.pack(side="left", fill="x", expand=True)
 
         # resize grip (bottom-right corner)
         grip = tk.Label(self.root, text=" ⛶ ", fg="#8B949E", bg="#0d1117",
                         font=("Consolas", 10), cursor="sizing")
         grip.place(relx=1.0, rely=1.0, anchor="se", x=-2, y=-2)
 
+        # body text: packed LAST so it fills remaining space
+        self.body = tk.Text(
+            self.root, bg="#0d1117", fg="#CCCCCC", bd=0,
+            highlightthickness=0, font=("Consolas", 10),
+            state="disabled", wrap="word",
+        )
+        self.body.pack(fill="both", expand=True, padx=8, pady=(4, 4))
+        for cat, col in COLORS.items():
+            self.body.tag_configure(cat, foreground=col)
+
         self.header.bind("<Button-1>", self._drag_start)
         self.header.bind("<B1-Motion>", self._drag_move)
         grip.bind("<Button-1>", self._resize_start)
         grip.bind("<B1-Motion>", self._resize_move)
 
-        self._on_tick = on_tick
         self.root.after(600, self._tick)
 
     # --- drag ---
@@ -85,9 +122,14 @@ class Overlay:
 
     def _tick(self):
         try:
+            try:
+                self.mode_btn.config(text=f"MODE: {self.get_mode().upper()}")
+                self.scan_status.config(text=self.get_scan())
+            except Exception:
+                pass
             lines = self._on_tick()
             if lines is None:
-                text, tags = [("PROClient not found - open the game", "beware")]
+                text = [("PROClient not found - open the game", "beware")]
             else:
                 def rank(pair):
                     t = pair[1].upper()
