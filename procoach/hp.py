@@ -9,7 +9,9 @@ import numpy as np
 
 
 def _masks(img):
-    a = np.asarray(img.convert("RGB"), dtype=np.int16)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    a = np.asarray(img, dtype=np.int16)
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
     colored = (g > 100) & (g > r + 25) & (g > b + 25)
     colored |= (r > 140) & (g > 120) & (b < 100)
@@ -24,7 +26,8 @@ def locate_bar(img, min_run=30):
     """Returns dict(frac, y, x0, x1) for the strongest HP bar, else None.
     Scans at half resolution for speed; returned coords are in original pixels."""
     try:
-        img = img.convert("RGB")
+        if img.mode != "RGB":
+            img = img.convert("RGB")
         orig_w = img.width
         scale = 2 if orig_w > 400 else 1
         if scale == 2:
@@ -43,6 +46,8 @@ def locate_bar(img, min_run=30):
         d = np.diff(padded)
         starts = np.where(d == 1)[0]
         ends = np.where(d == -1)[0]
+        if len(starts) == 0 or len(ends) == 0:
+            return None
         lens = ends - starts
         i = int(lens.argmax())
         bx0, bx1 = int(starts[i]), int(ends[i])

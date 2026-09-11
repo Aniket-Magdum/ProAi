@@ -1,3 +1,4 @@
+google-genai
 mss
 pillow
 pywin32

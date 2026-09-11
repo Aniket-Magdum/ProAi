@@ -39,14 +39,37 @@ def _process_exe(hwnd):
     return None
 
 
+import threading
+
+_cached_hwnd = None
+_sct_local = threading.local()
+
+
+def _get_sct():
+    if not hasattr(_sct_local, "sct") or _sct_local.sct is None:
+        _sct_local.sct = mss.mss()
+    return _sct_local.sct
+
+
 def find_pro_hwnd():
-    """Title match + process verification.
+    """Title match + process verification with O(1) cached handle validation.
 
     Many windows can contain 'proclient' in their title (a file-explorer folder,
     a browser tab, a chat) - reading those pixels poisons every OCR read. A
     candidate is only accepted when its owning process is actually
     PROClient.exe; when the process can't be queried we fall back to the
     title-only match (old behavior) rather than refusing the real game."""
+    global _cached_hwnd
+    if _cached_hwnd is not None:
+        try:
+            if win32gui.IsWindow(_cached_hwnd) and win32gui.IsWindowVisible(_cached_hwnd):
+                title = (win32gui.GetWindowText(_cached_hwnd) or "").lower()
+                if "proclient" in title:
+                    return _cached_hwnd
+        except Exception:
+            pass
+        _cached_hwnd = None
+
     found = []
 
     def cb(hwnd, _):
@@ -61,7 +84,10 @@ def find_pro_hwnd():
         found.append(hwnd)
 
     win32gui.EnumWindows(cb, None)
-    return found[0] if found else None
+    if found:
+        _cached_hwnd = found[0]
+        return _cached_hwnd
+    return None
 
 
 def client_rect(hwnd):
@@ -80,7 +106,8 @@ def grab_regions(hwnd, regions=REGIONS):
     if w <= 0 or h <= 0:
         return {}
     out = {}
-    with mss.mss() as sct:
+    try:
+        sct = _get_sct()
         for name, (fx0, fy0, fx1, fy1) in regions.items():
             box = {
                 "left": int(x0 + fx0 * w),
@@ -90,4 +117,7 @@ def grab_regions(hwnd, regions=REGIONS):
             }
             shot = sct.grab(box)
             out[name] = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    except Exception:
+        # Reset broken context on display resolution or desktop changes
+        _sct_local.sct = None
     return out

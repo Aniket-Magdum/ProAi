@@ -37,7 +37,11 @@ venv.bak/
 coach.lock
 state.txt
 battlestate.json
+saved_team.txt
 coach_errors.log
+.gemini_key
+.env*
+scratch/
 
 # IDEs and editors
 .idea/

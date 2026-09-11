@@ -12,3 +12,8 @@ def log_error(msg):
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
     except Exception:
         pass
+
+
+def get_coach(*args, **kwargs):
+    from .coach import Coach
+    return Coach(*args, **kwargs)

@@ -4,19 +4,17 @@ from pathlib import Path
 
 from . import calc
 from .calc import effectiveness
-from .state import DEX, MOVES
+from .state import DEX, MOVES, LEARNSETS, get_smogon_data
 
-_DATA = Path(__file__).resolve().parent.parent / "data"
-try:
-    with open(_DATA / "learnsets.json", encoding="utf8") as f:
-        LEARNSETS = json.load(f)
-except OSError:
-    LEARNSETS = {}
-try:
-    with open(_DATA / "smogon_sets.json", encoding="utf8") as f:
-        SMOGON = json.load(f)
-except OSError:
-    SMOGON = {}
+class _SmogonProxy(dict):
+    def get(self, key, default=None):
+        return get_smogon_data().get(key, default)
+    def __getitem__(self, key):
+        return get_smogon_data()[key]
+    def __contains__(self, key):
+        return key in get_smogon_data()
+
+SMOGON = _SmogonProxy()
 
 STAPLES = {
     "swordsdance", "nastyplot", "dragondance", "calmmind", "irondefense", "agility",
@@ -319,6 +317,15 @@ def advise(state):
     my = state.mons.get(state.my_active_key)
     th = state.mons.get(state.their_active_key)
 
+    if my and th:
+        th_floor = th.get("speed_floor")
+        th_ceil = th.get("speed_ceiling")
+        my_spd = calc.effective_speed(my)
+        if th_floor and th_floor >= my_spd:
+            out.append(("speed", f"SPEED: opponent confirmed faster (≥{th_floor} Spe) - expect them to move first"))
+        elif th_ceil and my_spd >= th_ceil:
+            out.append(("speed", f"SPEED: you confirmed faster (≤{th_ceil} Spe vs your {my_spd})"))
+
     if state.menu_mode == "attack" and my and th:
         outcome_lines = move_outcomes(state, my, th)
         if outcome_lines:
@@ -349,9 +356,15 @@ def advise(state):
                     if weff < 1:
                         out.append(("avoid", f"AVOID: {MOVES[worst[1]]['name']} (resisted)"))
             # speed
-            my_spd = est_speed(my["base_spe"], my["level"])
-            th_spd = est_speed(th["base_spe"], th["level"])
-            if my_spd > th_spd * 1.1:
+            my_spd = calc.effective_speed(my) if my else est_speed(my.get("base_spe", 80), my.get("level", 100))
+            th_spd = calc.effective_speed(th) if th else est_speed(th.get("base_spe", 80), th.get("level", 100))
+            th_floor = th.get("speed_floor") if th else None
+            th_ceil = th.get("speed_ceiling") if th else None
+            if th_floor and th_floor >= my_spd:
+                out.append(("speed", f"SPEED: opponent confirmed faster (≥{th_floor} Spe) - expect them to move first"))
+            elif th_ceil and my_spd >= th_ceil:
+                out.append(("speed", f"SPEED: you confirmed faster (≤{th_ceil} Spe vs your {my_spd})"))
+            elif my_spd > th_spd * 1.1:
                 out.append(("speed", "SPEED: you likely outspeed"))
             elif th_spd > my_spd * 1.1:
                 out.append(("speed", "SPEED: they likely outspeed - expect them to move first"))
